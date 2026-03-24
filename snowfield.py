@@ -29,6 +29,7 @@ from scipy import signal
 from scipy.signal import welch, csd, coherence
 from scipy.ndimage import median_filter
 from scipy.signal.windows import tukey, hann
+import pywt
 
 import utm
 import simpledas
@@ -617,7 +618,86 @@ def load_sapphire_data(
     # Attach station metadata
     st = sapphire_location(df_locations, st)
     return st
+    
+def load_sapphire_data_by_fiber(
+    t1: UTCDateTime,
+    t2: UTCDateTime,
+    base_dir: str,
+    sensors_by_fiber: dict,
+    df_locations: pd.DataFrame,
+    channel: str = "BDF"
+) -> Stream:
+    """
+    Load Sapphire infrasound data into an ObsPy Stream with station locations.
 
+    Parameters
+    ----------
+    t1, t2 : UTCDateTime
+        Start and end times for data loading.
+    base_dir : str
+        Root folder containing Fiber_X/Sapphires folders.
+    sensors_by_fiber : dict
+        Dictionary mapping fiber keys ('A','B',...) to sensor list (e.g., ['SM384', ...]).
+    df_locations : pd.DataFrame
+        DataFrame containing sensor metadata (station, lat, lon, elev).
+    channel : str
+        Channel code to read (default: "BDF").
+    
+    Returns
+    -------
+    st : obspy.Stream
+        Loaded Sapphire data with metadata.
+    """
+    
+    st = Stream()
+    
+    # Determine the file date convention (files roll at 04:00 UTC)
+    file_date = t1 if t1.hour >= 4 else t1 - 86400
+    date_string = file_date.strftime('%y%m%d')
+    
+    for fiber_key, sensors in sensors_by_fiber.items():
+        sub_path = f"Fiber_{fiber_key}/Sapphires"
+        fiber_path = os.path.join(base_dir, sub_path)
+        
+        # Convert sensor names from 'SM384' → '384' to match folder names
+        sensors_num = [s.replace("SM", "") for s in sensors]
+        print(f"🔹 Fiber {fiber_key}: loading {len(sensors_num)} sensors")
+        
+        for sensor in sensors_num:
+            sensor_path = os.path.join(fiber_path, sensor)
+            
+            if not os.path.isdir(sensor_path):
+                print(f"     ⚠️ Sensor folder missing: {sensor_path}")
+                continue
+            
+            # File pattern: S384_R001_250810_N001.msd
+            file_pattern = os.path.join(sensor_path, f"S{sensor}*{date_string}*.msd")
+            matches = glob.glob(file_pattern)
+            
+            if len(matches) == 0:
+                print(f"     ⚠️ No files matched: {file_pattern}")
+                continue
+            else:
+                print(f"     Found {len(matches)} file(s) for sensor {sensor}")
+            
+            for fname in matches:
+                try:
+                    st_temp = read(fname, starttime=t1, endtime=t2)
+                    st_temp = st_temp.select(channel=channel)
+                    if len(st_temp) > 0:
+                        st += st_temp
+                except Exception as e:
+                    print(f"       ⚠️ Could not read {fname}: {e}")
+    
+    # Trim to exact time window
+    st.trim(t1, t2)
+    
+    # Attach station metadata
+    st = sapphire_location(df_locations, st)
+    
+    print(f"\n✅ Finished loading. Total traces: {len(st)}")
+    return st
+    
 def summarize_stream(st: Stream):
     """ 
     Print a lightweight summary of a STream for sanity checking
@@ -860,55 +940,85 @@ def overlaps_window(t_file, t1, t2, file_len=86400):
     """
     return not (t_file > t2 or (t_file + file_len) < t1)
 
+def extract_serial_from_filename(fname: str) -> int:
+    serial_full = os.path.basename(fname).split(".")[0]  # e.g. 453025444
+    return int(serial_full[-5:])                         # e.g. 25444
+
+def _normalize_components(channel: str) -> set[str]:
+    """
+    Accepts: '*', '*Z', 'Z', 'HHZ', '*N', etc.
+    Returns one or more of {'Z','N','E'}.
+    """
+    channel = channel.strip().upper()
+    if channel == "*":
+        return {"Z", "N", "E"}
+
+    # If last char is one of Z/N/E, use that
+    if channel and channel[-1] in {"Z", "N", "E"}:
+        return {channel[-1]}
+
+    # Fallback: all
+    return {"Z", "N", "E"}
+
 def load_smartsolo_data(
     t1: UTCDateTime,
     t2: UTCDateTime,
     base_dir: str,
-    channel: str = '*Z',
+    channel: str = "*Z",
     file_len_est: float = 86400.0,
+    serial_whitelist: list[int] | None = None,
+    verbose: bool = False,
 ) -> Stream:
     """
-    Load SmartSolo MiniSEED data within a time window.
-
-    Parameters
-    ----------
-    t1, t2 : UTCDateTime
-        Start and end times of the requested window
-    base_dir : str
-        Directory containing SmartSolo MiniSEED files
-    channel : str, optional
-        Channel selector (default '*Z' for vertical)
-    file_len_est : float, optional
-        Estimated file duration in seconds
-
-    Returns
-    -------
-    st : obspy.Stream
-        Stream trimmed to [t1, t2]
+    Load SmartSolo MiniSEED data in [t1, t2], filtered by component and optional serial whitelist.
     """
 
-    file_list = sorted(glob.glob(os.path.join(base_dir, '*.miniseed')))
+    components = _normalize_components(channel)
+
+    # Build file list by component suffix in filename: .N.miniseed / .E.miniseed / .Z.miniseed
+    file_list = []
+    for comp in sorted(components):
+        file_list.extend(glob.glob(os.path.join(base_dir, f"*.{comp}.miniseed")))
+    file_list = sorted(file_list)
+
     st = Stream()
+    n_kept = 0
+    n_skipped_serial = 0
+    n_skipped_time = 0
 
     for fname in file_list:
         try:
-            t_file = parse_starttime_from_filename(fname)
+            if serial_whitelist is not None:
+                serial = extract_serial_from_filename(fname)
+                if serial not in serial_whitelist:
+                    n_skipped_serial += 1
+                    continue
 
-            # Skip files that cannot overlap the requested window
+            t_file = parse_starttime_from_filename(fname)
             if not overlaps_window(t_file, t1, t2, file_len_est):
+                n_skipped_time += 1
                 continue
 
             st_tmp = read(fname, starttime=t1, endtime=t2)
-            st_tmp = st_tmp.select(channel=channel)
-
             for tr in st_tmp:
                 st.append(tr)
+                n_kept += 1
 
-        except Exception:
+        except Exception as e:
+            if verbose:
+                print(f"Warning: could not read {fname}: {e}")
             continue
 
-    # Final safety trim
-    st.trim(t1, t2)
+    if len(st) > 0:
+        st.trim(t1, t2)
+
+    if verbose:
+        print(f"Components: {sorted(components)}")
+        print(f"Files considered: {len(file_list)}")
+        print(f"Skipped by serial: {n_skipped_serial}")
+        print(f"Skipped by time: {n_skipped_time}")
+        print(f"Traces loaded: {n_kept}")
+
     return st
 
 # Preprocessing the SmartSolo data
@@ -1185,6 +1295,115 @@ def build_collocated_triplets(solo_names, solo_coords,
 
     return pd.DataFrame(triplets)
 
+def rotate_to_fiber(east, north, azimuth_deg):
+    """
+    Rotate horizontal components (E, N) into fiber-aligned (P, O).
+
+    Parameters
+    ----------
+    east, north : np.ndarray
+        East and North component data arrays.
+    azimuth_deg : float
+        Fiber azimuth in degrees (clockwise from North).
+
+    Returns
+    -------
+    fiber_parallel, fiber_perp : np.ndarray, np.ndarray
+        Parallel (P) and perpendicular (O) components.
+    """
+    a = np.deg2rad(azimuth_deg)
+    fiber_parallel = north * np.cos(a) + east * np.sin(a)
+    fiber_perp = -north * np.sin(a) + east * np.cos(a)
+    return fiber_parallel, fiber_perp
+
+def rotate_smartsolo_to_fiber(
+    st_solo_orient,
+    azimuth_csv_path,
+    smartsolo_col="smartsolo",
+    azimuth_col="fiber_azimuth_deg",
+    include_vertical=True,
+):
+    """
+    Rotate SmartSolo N/E traces into fiber-parallel (P) and fiber-perp (O) traces.
+
+    Parameters
+    ----------
+    st_solo_orient : obspy.Stream
+        Input stream containing station traces with N/E (and optionally Z) channels.
+    azimuth_csv_path : str
+        Path to CSV containing station azimuth metadata.
+    smartsolo_col : str
+        CSV column name for station code.
+    azimuth_col : str
+        CSV column name for fiber azimuth (deg clockwise from North).
+    include_vertical : bool
+        If True, include original Z trace (copied) in output stream.
+
+    Returns
+    -------
+    st_rot : obspy.Stream
+        Rotated stream with channels ending in:
+        - P : fiber-parallel
+        - O : fiber-perpendicular
+        Plus Z if include_vertical=True and available.
+        
+    Usage
+    -----
+    st_rot = rotate_smartsolo_to_fiber(
+        st_solo_orient=st_solo_orient,
+        azimuth_csv_path="/Users/49573102/Documents/Infrasound Work/Norway/collocated_triplets_with_azimuth.csv",
+    )
+    print(st_rot)
+    """
+    meta = pd.read_csv(azimuth_csv_path)
+    meta[smartsolo_col] = meta[smartsolo_col].astype(str).str.strip()
+    azimuth_map = dict(zip(meta[smartsolo_col], meta[azimuth_col]))
+
+    st_rot = Stream()
+
+    for sta in sorted({tr.stats.station for tr in st_solo_orient}):
+        if sta not in azimuth_map:
+            continue
+
+        st_sta = st_solo_orient.select(station=sta)
+        tr_n_sel = st_sta.select(channel="*N")
+        tr_e_sel = st_sta.select(channel="*E")
+        tr_z_sel = st_sta.select(channel="*Z")
+
+        if len(tr_n_sel) == 0 or len(tr_e_sel) == 0:
+            continue
+
+        tr_n = tr_n_sel[0].copy()
+        tr_e = tr_e_sel[0].copy()
+
+        # Ensure matching sample lengths if needed
+        npts = min(len(tr_n.data), len(tr_e.data))
+        north = tr_n.data[:npts]
+        east = tr_e.data[:npts]
+
+        az = float(azimuth_map[sta])
+        par, perp = rotate_to_fiber(east=east, north=north, azimuth_deg=az)
+
+        tr_par = tr_n.copy()
+        tr_perp = tr_e.copy()
+
+        tr_par.data = par
+        tr_perp.data = perp
+        tr_par.stats.npts = len(par)
+        tr_perp.stats.npts = len(perp)
+
+        # Rename channels: last char -> P/O
+        tr_par.stats.channel = tr_par.stats.channel[:-1] + "P"
+        tr_perp.stats.channel = tr_perp.stats.channel[:-1] + "O"
+
+        st_rot += tr_par
+        st_rot += tr_perp
+
+        if include_vertical and len(tr_z_sel):
+            st_rot += tr_z_sel[0].copy()
+
+    return st_rot
+    
 def extract_triplet_waveforms(triplet, st_solo, st_sap, dfdas, n_das_channels=20, manual_channels=None):
     """
     Extract SmartSolo, Sapphire, and DAS waveforms for a single triplet.
@@ -1218,4 +1437,440 @@ def extract_triplet_waveforms(triplet, st_solo, st_sap, dfdas, n_das_channels=20
         "das_median": das_median,
         "das_mad": das_mad
     }
+
+# ==========================================================
+# Power Spectral Density (Single and Beamformed)
+# ==========================================================
+def compute_psd_trace(tr: Trace, nperseg: int = 2048):
+    """
+    Compute PSD for a single trace.
+    """
+    fs = tr.stats.sampling_rate
+    f, Pxx = welch(tr.data.astype(float), fs=fs, nperseg=nperseg)
+    return f, Pxx
+
+
+def compute_psd_stream(st: Stream, method="median", nperseg=2048):
+    """
+    Compute PSD across a stream (array-level PSD).
+
+    Parameters
+    ----------
+    method : 'median' or 'mean'
+    """
+    psds = []
+    for tr in st:
+        f, P = compute_psd_trace(tr, nperseg=nperseg)
+        psds.append(P)
+
+    psds = np.array(psds)
+
+    if method == "median":
+        P_out = np.median(psds, axis=0)
+    elif method == "mean":
+        P_out = np.mean(psds, axis=0)
+    else:
+        raise ValueError
+
+    return f, P_out
+
+
+def plot_psd(f, P, label=None, ax=None, loglog=True):
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    if loglog:
+        ax.loglog(f, P, label=label)
+    else:
+        ax.plot(f, P, label=label)
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("PSD")
+    if label:
+        ax.legend()
+    ax.grid(True, which="both", alpha=0.3)
+
+    return ax
+
+# ==========================================================
+# Frequency-Wavenumber Analysis
+# ==========================================================
+def stream_to_array_data(st: Stream):
+    """
+    Convert stream to matrix + coordinates for FK.
+    """
+    st = st.copy()
+    st.sort()
+
+    # Ensure equal lengths
+    npts = min([tr.stats.npts for tr in st])
+    data = np.array([tr.data[:npts] for tr in st])
+
+    # Coordinates
+    x_km, stations = get_array_coords(st)
+    x = x_km[:, 0]
+    y = x_km[:, 1]
+
+    fs = st[0].stats.sampling_rate
+
+    return data, x, y, fs
+
+def fk_analysis(data, x_km, y_km, fs, fmin, fmax, smax=0.4, ngrid=51):
+    """
+    Wide-band F-K analysis.
+
+    Parameters
+    ----------
+    data   : (N_sta, N_samp) array, pre-filtered waveforms
+    x_km   : (N_sta,) East offsets from centroid [km]
+    y_km   : (N_sta,) North offsets from centroid [km]
+    fs     : sampling rate [Hz]
+    fmin, fmax : frequency band [Hz]
+    smax   : slowness grid limit [s/km]
+    ngrid  : number of grid points per axis
+
+    Returns
+    -------
+    sx_vec, sy_vec : 1-D slowness axes [s/km]
+    power_grid     : (ngrid, ngrid) absolute beam power
+    semblance_grid : (ngrid, ngrid) semblance in [0,1]
+    """
+    N_sta, N_samp = data.shape
+
+    # ── Detrend each trace (critical for unfiltered data) ─────────────────────
+    # Copy to avoid modifying original, then remove linear trend
+    data = data.copy()
+    for i in range(N_sta):
+        # Remove best-fit line
+        x = np.arange(N_samp)
+        coeffs = np.polyfit(x, data[i], 1)
+        data[i] -= np.polyval(coeffs, x)
+    
+    # ── FFT ────────────────────────────────────────────────────────────────────
+    NFFT = N_samp
+    freqs = np.fft.rfftfreq(NFFT, d=1.0/fs)          # shape: (NFFT//2+1,)
+    U = np.fft.rfft(data, n=NFFT, axis=1)             # shape: (N_sta, NFFT//2+1)
+
+    # ── Frequency mask ─────────────────────────────────────────────────────────
+    f_mask = (freqs >= fmin) & (freqs <= fmax)
+    freqs_sel = freqs[f_mask]                          # selected frequencies
+    U_sel = U[:, f_mask]                               # (N_sta, N_f)
+    df = freqs[1] - freqs[0]
+
+    # ── Incoherent (denominator) power ─────────────────────────────────────────
+    incoherent_power = np.sum(np.abs(U_sel)**2) * df / N_sta   # scalar
+
+    # ── Slowness grid ──────────────────────────────────────────────────────────
+    sx_vec = np.linspace(-smax, smax, ngrid)           # E-W slowness
+    sy_vec = np.linspace(-smax, smax, ngrid)           # N-S slowness
+    SX, SY = np.meshgrid(sx_vec, sy_vec)               # (ngrid, ngrid)
+
+    power_grid     = np.zeros((ngrid, ngrid))
+    semblance_grid = np.zeros((ngrid, ngrid))
+
+    # ── Phase shift matrix  (N_sta, N_f, ngrid, ngrid)  ── too large!
+    # Use vectorised approach over frequency, loop over slowness grid
+    # For each frequency bin build the phase matrix:
+    #   phase[i, gx, gy] = 2π f (sx[gx,gy] * x[i] + sy[gx,gy] * y[i])
+
+    # Pre-compute position outer products with the flattened slowness vectors
+    # shapes: sx_flat (ngrid²,), x_km (N_sta,)
+    sx_flat = SX.ravel()   # (ngrid²,)
+    sy_flat = SY.ravel()   # (ngrid²,)
+
+    # delay[i, g] = sx_flat[g]*x[i] + sy_flat[g]*y[i]  →  (N_sta, ngrid²)
+    delay = np.outer(x_km, sx_flat) + np.outer(y_km, sy_flat)  # (N_sta, ngrid²)
+
+    beam_power_flat = np.zeros(ngrid * ngrid)
+
+    for k, f in enumerate(freqs_sel):
+        # Steering phase for all stations and all grid points
+        steer = np.exp(1j * 2 * np.pi * f * delay)    # (N_sta, ngrid²)
+        # Beam: sum over stations
+        # U_sel[:, k] shape: (N_sta,)
+        beam = (U_sel[:, k, np.newaxis] * steer).sum(axis=0) / N_sta  # (ngrid²,)
+        beam_power_flat += np.abs(beam)**2 * df
+
+    power_grid     = beam_power_flat.reshape(ngrid, ngrid)
+    semblance_grid = power_grid / incoherent_power
+
+    return sx_vec, sy_vec, power_grid, semblance_grid
+
+def run_fk(
+    st: Stream,
+    fmin=0.5,
+    fmax=5.0,
+    smax=0.4,
+    ngrid=51
+):
+    """
+    High-level FK interface.
+    """
+    data, x, y, fs = stream_to_array_data(st)
+
+    sx, sy, power, semblance = fk_analysis(
+        data, x, y, fs, fmin, fmax,
+        smax=smax, ngrid=ngrid
+    )
+
+    # Peak
+    idx = np.unravel_index(np.argmax(power), power.shape)
+    sx_peak = sx[idx[1]]
+    sy_peak = sy[idx[0]]
+
+    slow = np.sqrt(sx_peak**2 + sy_peak**2)
+    vapp = 1 / slow if slow > 0 else np.inf
+    baz = (np.degrees(np.arctan2(sx_peak, sy_peak)) + 180) % 360
+
+    return {
+        "sx": sx,
+        "sy": sy,
+        "power": power,
+        "semblance": semblance,
+        "sx_peak": sx_peak,
+        "sy_peak": sy_peak,
+        "vapp": vapp,
+        "baz": baz,
+    }
+
+def add_velocity_circles(ax, sx_vec, sy_vec, velocities, color='white', lw=0.8, ls='--'):
+    """Overplot constant-apparent-velocity circles on a slowness map."""
+    for v in velocities:
+        s_ref = 1.0 / v  # slowness magnitude = 1/velocity
+        theta = np.linspace(0, 2*np.pi, 360)
+        cx = s_ref * np.sin(theta)
+        cy = s_ref * np.cos(theta)
+        # only plot if circle is inside the grid
+        if s_ref <= sx_vec.max():
+            ax.plot(cx, cy, color=color, lw=lw, ls=ls)
+            # label at top of circle
+            ax.text(0, s_ref*1.02, f'{v:.2f} km/s',
+                    ha='center', va='bottom', fontsize=7, color=color)
+
+
+def plot_fk(sx_vec, sy_vec, grid, title='F-K Power',
+            cmap='jet', vmin_db=-10, vmax_db=0,
+            half_contour_db=None,
+            ref_velocities=None,
+            peak_sx=None, peak_sy=None,
+            use_db=True, vmin_linear=0, vmax_linear=1):
+    """
+    Plot a slowness map (power or semblance).
+
+    Parameters
+    ----------
+    grid           : 2-D array on (sy, sx) axes
+    half_contour_db: if not None, draw contour at this dB level (e.g. -3 or -6)
+    use_db         : if True, plot in dB scale; if False, use linear scale
+    vmin_linear, vmax_linear : limits for linear scale (when use_db=False)
+    """
+    if use_db:
+        grid_plot = 10 * np.log10(grid / grid.max() + 1e-30)
+        vmin, vmax = vmin_db, vmax_db
+        cbar_label = 'Relative Power  [dB]'
+    else:
+        grid_plot = grid
+        vmin, vmax = vmin_linear, vmax_linear
+        cbar_label = 'Semblance'
+
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    im = ax.pcolormesh(sx_vec, sy_vec, grid_plot,
+                       cmap=cmap, vmin=vmin, vmax=vmax,
+                       shading='auto')
+    cb = fig.colorbar(im, ax=ax, label=cbar_label)
+
+    # Contours
+    if use_db:
+        # Standard dB contours (exclude half_contour_db to avoid overlap)
+        levels_db = np.arange(vmin_db, 0, 1)
+        if half_contour_db is not None and half_contour_db in levels_db:
+            levels_db = levels_db[levels_db != half_contour_db]
+        cs = ax.contour(sx_vec, sy_vec, grid_plot, levels=levels_db,
+                        colors='white', linewidths=0.5, alpha=0.5)
+
+        # Half-power / half-amplitude contour
+        if half_contour_db is not None:
+            # Check if this level exists in the data
+            if grid_plot.min() <= half_contour_db <= grid_plot.max():
+                cs_half = ax.contour(sx_vec, sy_vec, grid_plot,
+                                     levels=[half_contour_db],
+                                     colors='black', linewidths=1.2, linestyles='--', zorder=10)
+                label_str = f'{half_contour_db} dB'
+                if half_contour_db == -3:
+                    label_str += '  (½ power)'
+                elif half_contour_db == -6:
+                    label_str += '  (½ amplitude / ¼ power)'
+                # Label the contour
+                ax.clabel(cs_half, fmt=label_str, fontsize=8, inline=True)
+    else:
+        # Linear contours for semblance
+        levels_linear = np.arange(0.1, 1.0, 0.1)
+        cs = ax.contour(sx_vec, sy_vec, grid_plot, levels=levels_linear,
+                        colors='white', linewidths=0.5, alpha=0.5)
+
+    # Velocity reference circles
+    if ref_velocities:
+        add_velocity_circles(ax, sx_vec, sy_vec, ref_velocities)
+
+    # Peak marker
+    if peak_sx is not None:
+        ax.plot(peak_sx, peak_sy, 'w+', ms=12, mew=2, zorder=10)
+
+    ax.set_xlabel('Slowness $s_x$ (E–W)  [s/km]')
+    ax.set_ylabel('Slowness $s_y$ (N–S)  [s/km]')
+    ax.set_title(title)
+    ax.set_aspect('equal')
+    ax.axhline(0, color='k', lw=0.5, ls=':')
+    ax.axvline(0, color='k', lw=0.5, ls=':')
+    ax.invert_xaxis()  # Invert x-axis so East (+) is right, West (-) is left
+    ax.invert_yaxis()  # Invert y-axis to match standard map projection 
+    plt.tight_layout()
+    return fig
+
+def sliding_fk(
+    st: Stream,
+    win_len: float,
+    step: float,
+    fmin=0.5,
+    fmax=5.0,
+    smax=0.4,
+    ngrid=51,
+):
+    """
+    Sliding window FK detection.
+
+    Returns list of detections:
+        time, baz, velocity, semblance
+    """
+
+    t0 = min(tr.stats.starttime for tr in st)
+    t1 = max(tr.stats.endtime for tr in st)
+
+    results = []
+
+    t = t0
+    while t + win_len <= t1:
+        st_win = st.copy().trim(t, t + win_len)
+
+        try:
+            fk = run_fk(st_win, fmin, fmax, smax, ngrid)
+
+            results.append({
+                "time": t,
+                "baz": fk["baz"],
+                "vapp": fk["vapp"],
+                "semblance": np.max(fk["semblance"])
+            })
+
+        except Exception:
+            pass
+
+        t += step
+
+    return pd.DataFrame(results)
+
+def plot_sliding_fk_results(df, baz_range=(0, 360), vapp_range=(0, 5), semblance_threshold=0.5):
+    """
+    Plot sliding FK results as a scatter plot of backazimuth through time, with points
+    colored by semblance. Only points above the semblance threshold are shown.
+    
+    A reference beamformed trace is plotted above the scatter plot, showing the semblance over time, with a horizontal line indicating the threshold.
+    """
+    fig, (ax_scatter, ax_beam) = plt.subplots(2, 1, figsize=(10, 6), sharex=True,
+                                              gridspec_kw={'height_ratios': [3, 1]})
+
+    # Scatter plot of detections
+    df_detect = df[df['semblance'] >= semblance_threshold]
+    sc = ax_scatter.scatter(df_detect['time'], df_detect['baz'], c=df_detect['semblance'],
+                            cmap='viridis', vmin=semblance_threshold, vmax=1.0, edgecolor='k')
+    ax_scatter.set_ylabel('Backazimuth (°)')
+    ax_scatter.set_title('Sliding FK Detections')
+    ax_scatter.set_ylim(baz_range)
+    ax_scatter.grid(True)
+
+    # Colorbar for scatter plot
+    cbar = plt.colorbar(sc, ax=ax_scatter, label='Semblance')
+
+    # Beamformed trace (semblance over time)
+    ax_beam.plot(df['time'], df['semblance'], color='blue')
+    ax_beam.axhline(semblance_threshold, color='red', linestyle='--', label='Threshold')
+    ax_beam.set_xlabel('Time')
+    ax_beam.set_ylabel('Semblance')
+    ax_beam.set_ylim(vapp_range)
+    ax_beam.legend()
+    ax_beam.grid(True)
+
+    plt.tight_layout()
+    return fig
+
+# ==========================================================
+# Spectrograms
+# ==========================================================
+def compute_spectrogram(tr: Trace, nfft=256):
+    f, t, Sxx = signal.spectrogram(
+        tr.data.astype(float),
+        fs=tr.stats.sampling_rate,
+        nperseg=nfft,
+        noverlap=nfft // 2,
+    )
+    return f, t, np.log10(Sxx + 1e-12)
+
+
+def plot_spectrogram(tr: Trace, nfft=256, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    f, t, Sxx = compute_spectrogram(tr, nfft=nfft)
+
+    t = t + (tr.stats.starttime - tr.stats.starttime)
+
+    pcm = ax.pcolormesh(t, f, Sxx, shading="auto", cmap="nipy_spectral")
+    ax.set_ylabel("Freq (Hz)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylim([0.5, f.max()])
+
+    plt.colorbar(pcm, ax=ax, label="log10(Power)")
+    return ax
+
+# ==========================================================
+# Scalogram
+# ==========================================================
+def compute_scalogram(
+    tr: Trace,
+    wavelet="morl",
+    n_freqs=64,
+    fmin=0.5,
+    fmax=20,
+):
+    dt = tr.stats.delta
+    freqs = np.linspace(fmin, fmax, n_freqs)
+
+    scales = pywt.central_frequency(wavelet) / (freqs * dt)
+
+    coeffs, _ = pywt.cwt(
+        tr.data.astype(float),
+        scales,
+        wavelet,
+        sampling_period=dt,
+    )
+
+    power = np.log10(np.abs(coeffs)**2 + 1e-12)
+
+    t = np.arange(tr.stats.npts) * dt
+
+    return t, freqs, power
+
+
+def plot_scalogram(tr: Trace, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    t, f, P = compute_scalogram(tr)
+
+    pcm = ax.pcolormesh(t, f, P, shading="auto", cmap="nipy_spectral")
+    ax.set_ylabel("Freq (Hz)")
+    ax.set_xlabel("Time (s)")
+
+    plt.colorbar(pcm, ax=ax, label="log10(CWT Power)")
+    return ax
     
